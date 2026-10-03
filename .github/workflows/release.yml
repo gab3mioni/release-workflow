@@ -115,6 +115,8 @@ jobs:
           OUTPUT: ${{ runner.temp }}/git-cliff-version.txt
 
       - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -131,8 +133,17 @@ jobs:
             range="$BASE_SHA..HEAD"
           fi
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            echo "::error::Tag $tag already exists: no releasable commits since the last release."
-            exit 1
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "::error::Tag $tag already exists: no releasable commits since the last release."
+              exit 1
+            fi
+            echo "RELEASE_ONLY=true" >> "$GITHUB_ENV"
+            if [ "$(git tag -l | grep -Ec "$pattern")" -eq 1 ]; then
+              range="$BASE_SHA..$tag"
+            else
+              range=--latest
+            fi
+            echo "Tag $tag has no Release: publishing only the Release."
           fi
           echo "TAG=$tag" >> "$GITHUB_ENV"
           echo "RANGE=$range" >> "$GITHUB_ENV"
@@ -141,7 +152,7 @@ jobs:
       - id: changelog
         run: |
           git cliff --tag-pattern "$TAG_PATTERN" --tag "$TAG" --strip all "$RANGE" > "$RUNNER_TEMP/notes.md"
-          if [ -n "$CHANGELOG_PATH" ]; then
+          if [ -n "$CHANGELOG_PATH" ] && [ -z "$RELEASE_ONLY" ]; then
             if [ -f "$CHANGELOG_PATH" ]; then
               git cliff --tag-pattern "$TAG_PATTERN" --tag "$TAG" --prepend "$CHANGELOG_PATH" "$RANGE"
             else
@@ -152,6 +163,7 @@ jobs:
           fi
 
       - id: tag
+        if: env.RELEASE_ONLY != 'true'
         run: |
           git tag -a "$TAG" -m "$TAG"
           git push --atomic origin "HEAD:refs/heads/$BASE_REF" "refs/tags/$TAG"
@@ -162,7 +174,7 @@ jobs:
         run: gh release create "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag
 
       - id: sync
-        if: inputs.sync-branch != ''
+        if: inputs.sync-branch != '' && env.RELEASE_ONLY != 'true'
         run: |
           if ! git push origin "HEAD:refs/heads/$SYNC_BRANCH"; then
             echo "::warning::Could not fast-forward $SYNC_BRANCH to $TAG. Merge $BASE_REF into $SYNC_BRANCH manually."
