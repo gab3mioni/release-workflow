@@ -76,7 +76,8 @@ Se `main` exige PR para receber commits, o workflow não consegue commitar o cha
 ## Falhas
 
 - **main andou durante o job.** O commit do changelog e a tag vão num único push atômico. Se `main` recebeu outro commit, o push é rejeitado e nada é publicado. Rode o job de novo.
-- **Tag já existe.** Se a versão calculada já tem tag, não há commits que gerem release. O job falha com `Tag <tag> already exists: no releasable commits since the last release.`
+- **Tag já existe.** Se a versão calculada já tem tag e Release, não há commits que gerem release. O job falha com `Tag <tag> already exists: no releasable commits since the last release.`
+- **Release não criada.** Se `gh release create` falha depois do push, a tag fica sem Release. Rode o job de novo: ele pula changelog, tag e sync e só publica a Release, com as notas daquela tag.
 - **Sync rejeitado.** Se `sync-branch` divergiu de `main`, o push falha com um warning e o job termina verde. Faça o merge de `main` em `sync-branch` manualmente.
 
 ## Versões deste repositório
