@@ -1,0 +1,181 @@
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      tag-prefix:
+        description: Tag prefix.
+        type: string
+        required: false
+        default: v
+      changelog-path:
+        description: Changelog file to commit. Empty publishes only the tag and the Release.
+        type: string
+        required: false
+        default: CHANGELOG.md
+      sync-branch:
+        description: Branch that receives the release commit afterwards. Empty skips the sync.
+        type: string
+        required: false
+        default: develop
+      initial-version:
+        description: Version used when the repository has no tag with the prefix.
+        type: string
+        required: false
+        default: 0.1.0
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG_PREFIX: ${{ inputs.tag-prefix }}
+      CHANGELOG_PATH: ${{ inputs.changelog-path }}
+      SYNC_BRANCH: ${{ inputs.sync-branch }}
+      INITIAL_VERSION: ${{ inputs.initial-version }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - id: merge-check
+        run: |
+          parents=$(git rev-list --parents -n 1 "$MERGE_SHA" | wc -w)
+          if [ "$parents" -ne 3 ]; then
+            echo "::error::$MERGE_SHA is not a merge commit. Merge develop into main with a merge commit (not squash or rebase); nothing was published."
+            exit 1
+          fi
+
+      - id: cliff-config
+        run: |
+          if [ ! -f cliff.toml ]; then
+            cat > "$RUNNER_TEMP/cliff.toml" <<'EOF'
+          [changelog]
+          header = """
+          # Changelog\n
+          """
+          body = """
+          {% if version %}\
+          ## {{ version }} - {{ timestamp | date(format="%Y-%m-%d") }}
+          {% else %}\
+          ## Unreleased
+          {% endif %}\
+          {% for group, commits in commits | group_by(attribute="group") %}
+          ### {{ group | striptags | trim | upper_first }}
+          {% for commit in commits %}
+          - {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message | upper_first }}\
+          {% endfor %}
+          {% endfor %}\n
+          """
+          trim = true
+
+          [git]
+          conventional_commits = true
+          filter_unconventional = true
+          split_commits = false
+          commit_parsers = [
+            { message = "^Merge", skip = true },
+            { message = "^chore\\(release\\)", skip = true },
+            { message = "^feat", group = "<!-- 0 -->Features" },
+            { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
+            { message = "^perf", group = "<!-- 2 -->Performance" },
+            { message = "^refactor", group = "<!-- 3 -->Refactor" },
+            { message = "^doc", group = "<!-- 4 -->Documentation" },
+            { message = "^test", group = "<!-- 5 -->Tests" },
+            { message = "^(build|ci)", group = "<!-- 6 -->Build" },
+            { message = ".*", group = "<!-- 7 -->Miscellaneous" },
+          ]
+          filter_commits = false
+          sort_commits = "oldest"
+
+          [bump]
+          features_always_bump_minor = true
+          breaking_always_bump_major = false
+          EOF
+            echo "GIT_CLIFF_CONFIG=$RUNNER_TEMP/cliff.toml" >> "$GITHUB_ENV"
+          fi
+
+      - uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
+        with:
+          version: v2.14.2
+          args: --version
+        env:
+          OUTPUT: ${{ runner.temp }}/git-cliff-version.txt
+
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          echo "$RUNNER_TEMP/git-cliff/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/git-cliff/bin:$PATH"
+          escaped=$(printf '%s' "$TAG_PREFIX" | sed 's/[][\.*^$+?(){}|/]/\\&/g')
+          pattern="^${escaped}[0-9]+\.[0-9]+\.[0-9]+$"
+          echo "TAG_PATTERN=$pattern" >> "$GITHUB_ENV"
+          if git tag -l | grep -Eq "$pattern"; then
+            tag=$(git cliff --tag-pattern "$pattern" --bumped-version)
+            range=--unreleased
+          else
+            tag="${TAG_PREFIX}${INITIAL_VERSION}"
+            range="$BASE_SHA..HEAD"
+          fi
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "::error::Tag $tag already exists: no releasable commits since the last release."
+              exit 1
+            fi
+            echo "RELEASE_ONLY=true" >> "$GITHUB_ENV"
+            if [ "$(git tag -l | grep -Ec "$pattern")" -eq 1 ]; then
+              range="$BASE_SHA..$tag"
+            else
+              range=--latest
+            fi
+            echo "Tag $tag has no Release: publishing only the Release."
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "RANGE=$range" >> "$GITHUB_ENV"
+          echo "Next release: $tag"
+
+      - id: changelog
+        run: |
+          git cliff --tag-pattern "$TAG_PATTERN" --tag "$TAG" --strip all "$RANGE" > "$RUNNER_TEMP/notes.md"
+          if [ -n "$CHANGELOG_PATH" ] && [ -z "$RELEASE_ONLY" ]; then
+            if [ -f "$CHANGELOG_PATH" ]; then
+              git cliff --tag-pattern "$TAG_PATTERN" --tag "$TAG" --prepend "$CHANGELOG_PATH" "$RANGE"
+            else
+              git cliff --tag-pattern "$TAG_PATTERN" --tag "$TAG" --output "$CHANGELOG_PATH" "$RANGE"
+            fi
+            git add -- "$CHANGELOG_PATH"
+            git commit -m "chore(release): $TAG"
+          fi
+
+      - id: tag
+        if: env.RELEASE_ONLY != 'true'
+        run: |
+          git tag -a "$TAG" -m "$TAG"
+          git push --atomic origin "HEAD:refs/heads/$BASE_REF" "refs/tags/$TAG"
+
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag
+
+      - id: sync
+        if: inputs.sync-branch != '' && env.RELEASE_ONLY != 'true'
+        run: |
+          if ! git push origin "HEAD:refs/heads/$SYNC_BRANCH"; then
+            echo "::warning::Could not fast-forward $SYNC_BRANCH to $TAG. Merge $BASE_REF into $SYNC_BRANCH manually."
+          fi
